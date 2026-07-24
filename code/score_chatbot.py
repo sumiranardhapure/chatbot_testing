@@ -8,17 +8,22 @@ Setup (run once in terminal):
     pip3 install pandas openpyxl rapidfuzz indic-transliteration
 
 Usage:
-    1. Place this script, prompt bank, and golden dataset in the same folder.
-    2. Update FILE PATHS below if your filenames differ.
-    3. Run: python3 score_chatbot.py
+    Run from any directory:
+        python3 code/score_chatbot.py
+    Input files are read from data/, output is written to output/.
 
 Output:
     Chatbot_Scoring_Results.xlsx — three sheets: Summary, Standard Scores, Adversarial Scores.
 """
 
 import re
+from pathlib import Path
 import pandas as pd
 from openpyxl.styles import PatternFill, Font, Alignment
+
+BASE_DIR   = Path(__file__).parent.parent
+DATA_DIR   = BASE_DIR / "data"
+OUTPUT_DIR = BASE_DIR / "output"
 
 try:
     from rapidfuzz import fuzz
@@ -34,11 +39,24 @@ try:
 except ImportError:
     INDIC_AVAILABLE = False
 
+try:
+    from sentence_transformers import SentenceTransformer
+    from sentence_transformers.util import cos_sim
+    _SEMANTIC_MODEL = SentenceTransformer('paraphrase-multilingual-MiniLM-L12-v2')
+    SEMANTIC_AVAILABLE = True
+except ImportError:
+    SEMANTIC_AVAILABLE = False
+    print("INFO: sentence-transformers not installed — semantic matching disabled.")
+    print("      Run: pip install sentence-transformers")
+
+
+# ─── TUNABLE THRESHOLDS ───────────────────────────────────────────────────────
+SEMANTIC_THRESHOLD = 0.60   # cosine similarity floor for semantic keyword match
 
 # ─── FILE PATHS ───────────────────────────────────────────────────────────────
-PROMPT_BANK_FILE    = "prompt_file_v2.xlsx"
-GOLDEN_DATASET_FILE = "golden_dataset_v2.xlsx"
-OUTPUT_FILE         = "Chatbot_Scoring_Results_v4.xlsx"
+PROMPT_BANK_FILE    = DATA_DIR / "Prompt Question Bank.xlsx"
+GOLDEN_DATASET_FILE = DATA_DIR / "golden_dataset_v2.xlsx"
+OUTPUT_FILE         = OUTPUT_DIR / "Chatbot_Scoring_Results_v4.xlsx"
 
 
 # ─── SUB-DISTRICT → DISTRICT MAPPING ─────────────────────────────────────────
@@ -120,7 +138,7 @@ FLAGGING_PHRASES = [
     "not a valid", "soil type", "does not match", "wrong", "not exist",
     "mismatch", "not supported", "not calibrated",
     "कृपया", "जानकारी दें", "जिला बताएं", "भूमि प्रकार", "मुझे बताएं",
-    "सही नहीं", "मान्य नहीं", "उपलब्ध नहीं", "please tell", "tell me your", "bata", "batao"
+    "सही नहीं", "मान्य नहीं", "उपलब्ध नहीं", "please tell", "tell me your", "bata", "batao",
     "kaun sa", "कौन सा"
 ]
 
@@ -215,17 +233,34 @@ def build_union_keywords(golden_rows):
         if pd.isna(kw_str):
             continue
         for raw in str(kw_str).replace(";", "\n").split("\n"):
-            sub_items = [i.strip() for i in raw.lstrip(".").strip().split(",") if i.strip()]
+            sub_items = [i.strip() for i in re.sub(r'^[•.\s]+', '', raw).strip().split(",") if i.strip()]
             new_kws = [kw for kw in sub_items if kw and kw.lower() not in seen]
             seen.update(kw.lower() for kw in new_kws)
             union.extend(new_kws)
     return union
 
+def split_into_chunks(text):
+    raw = re.split(r'[\n]+|(?<=[.!?])\s+', text)
+    chunks = []
+    for part in raw:
+        chunks.extend(re.split(r'\s*[-•*]\s+', part))
+    return [c.strip() for c in chunks if len(c.strip()) > 8]
+
 def score_keywords(response, keywords, fuzzy_threshold=75):
     if not keywords or pd.isna(response):
         return None, [], []
     resp = to_latin(str(response))
+
+    # Pre-compute response chunk embeddings once — reused across all keywords for this row
+    chunk_embs = None
+    if SEMANTIC_AVAILABLE:
+        chunks = split_into_chunks(resp)
+        if chunks:
+            chunk_embs = _SEMANTIC_MODEL.encode(chunks, convert_to_tensor=True)
+
     matched, missed = [], []
+    semantic_queue = []
+
     for kw in keywords:
         kw_lower  = kw.lower()
         name_only = extract_name(kw).lower()
@@ -235,8 +270,23 @@ def score_keywords(response, keywords, fuzzy_threshold=75):
             matched.append(f"{kw} [name match]")
         elif RAPIDFUZZ_AVAILABLE and fuzz.partial_ratio(kw_lower, resp) >= fuzzy_threshold:
             matched.append(f"{kw} [~fuzzy]")
+        elif chunk_embs is not None:
+            semantic_queue.append(kw)
         else:
             missed.append(kw)
+
+    # Batch-encode all queued keywords and check against response chunks
+    if semantic_queue:
+        kw_embs = _SEMANTIC_MODEL.encode(
+            [kw.lower() for kw in semantic_queue], convert_to_tensor=True
+        )
+        sims = cos_sim(kw_embs, chunk_embs)  # (n_queued, n_chunks)
+        for kw, row_sims in zip(semantic_queue, sims):
+            if row_sims.max().item() >= SEMANTIC_THRESHOLD:
+                matched.append(f"{kw} [~semantic]")
+            else:
+                missed.append(kw)
+
     pct = round(len(matched) / len(keywords) * 100, 1) if keywords else None
     return pct, matched, missed
 
