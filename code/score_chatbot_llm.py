@@ -1,63 +1,74 @@
 #!/usr/bin/env python3
 """
-CRIDA DACP Chatbot Scoring Script
-===================================
+CRIDA DACP Chatbot Scoring Script — LLM-as-judge edition
+=========================================================
 Scores chatbot responses (col L "English response (normal onset)") against
-golden dataset keywords. Restricted to Balrampur, Surajpur, and Jashpur districts.
+golden dataset keywords using Claude Sonnet 4.6 as the judge.
+Restricted to Balrampur, Surajpur, and Jashpur districts.
 
 Setup (run once in terminal):
-    pip3 install pandas openpyxl rapidfuzz indic-transliteration
+    pip3 install pandas openpyxl anthropic
+    export ANTHROPIC_API_KEY=sk-...
 
 Usage:
     Run from any directory:
-        python3 code/score_chatbot.py
+        python3 code/score_chatbot_llm.py
     Input files are read from data/, output is written to output/.
 
 Output:
-    Chatbot_Scoring_Results_v4.xlsx — two sheets: Summary, Standard Scores.
+    Chatbot_Scoring_Results_llm.xlsx — two sheets: Summary, Standard Scores.
 """
 
 import re
+import json
+import os
 from pathlib import Path
 import pandas as pd
 from openpyxl.styles import PatternFill, Font, Alignment
+import anthropic
 
 BASE_DIR   = Path(__file__).parent.parent
 DATA_DIR   = BASE_DIR / "data"
 OUTPUT_DIR = BASE_DIR / "output"
 
-try:
-    from rapidfuzz import fuzz
-    RAPIDFUZZ_AVAILABLE = True
-except ImportError:
-    RAPIDFUZZ_AVAILABLE = False
-    print("WARNING: rapidfuzz not installed. Run: pip3 install rapidfuzz")
+# ─── ANTHROPIC CLIENT ─────────────────────────────────────────────────────────
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
+if not ANTHROPIC_API_KEY:
+    raise EnvironmentError(
+        "ANTHROPIC_API_KEY environment variable is not set.\n"
+        "Run: export ANTHROPIC_API_KEY=sk-..."
+    )
 
-try:
-    from indic_transliteration import sanscript
-    from indic_transliteration.sanscript import transliterate
-    INDIC_AVAILABLE = True
-except ImportError:
-    INDIC_AVAILABLE = False
+_ANTHROPIC_CLIENT = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+LLM_MODEL = "claude-sonnet-4-6"
 
-try:
-    from sentence_transformers import SentenceTransformer
-    from sentence_transformers.util import cos_sim
-    _SEMANTIC_MODEL = SentenceTransformer('paraphrase-multilingual-MiniLM-L12-v2')
-    SEMANTIC_AVAILABLE = True
-except ImportError:
-    SEMANTIC_AVAILABLE = False
-    print("INFO: sentence-transformers not installed — semantic matching disabled.")
-    print("      Run: pip install sentence-transformers")
+# ─── PROMPT TEMPLATE ─────────────────────────────────────────────────────────
+KEYWORD_JUDGE_PROMPT = """\
+You are evaluating whether an agricultural chatbot response covers expected keywords.
 
+Chatbot response:
+\"\"\"
+{response}
+\"\"\"
 
-# ─── TUNABLE THRESHOLDS ───────────────────────────────────────────────────────
-SEMANTIC_THRESHOLD = 0.60   # cosine similarity floor for semantic keyword match
+Expected keywords (may include English and Hindi agricultural terms):
+{keywords_list}
+
+For each keyword, decide if the chatbot response captures the same concept — even if worded differently, abbreviated, or expressed in a different language. Be flexible: partial mentions count as long as meaning is conveyed. Don't penalize vague phrases in keywords missed and don't double count keywords if mentioned twice.
+
+Return ONLY a JSON object with two arrays:
+{{
+  "captured": ["keyword1", "keyword2", ...],
+  "missed":   ["keyword3", ...]
+}}
+
+Use the exact keyword strings from the list above. Do not add any explanation outside the JSON.\
+"""
 
 # ─── FILE PATHS ───────────────────────────────────────────────────────────────
 PROMPT_BANK_FILE    = DATA_DIR / "Chatbot_Query_Bank_Surajpur_Balrampur_Jashpur_v2.xlsx"
 GOLDEN_DATASET_FILE = DATA_DIR / "golden_dataset_v2.xlsx"
-OUTPUT_FILE         = OUTPUT_DIR / "Chatbot_Scoring_Results_v5.xlsx"
+OUTPUT_FILE         = OUTPUT_DIR / "Chatbot_Scoring_Results_llm.xlsx"
 
 
 # ─── SUB-DISTRICT → DISTRICT MAPPING ─────────────────────────────────────────
@@ -128,53 +139,6 @@ MONSOON_SCENARIO_KEYWORDS = [
 ]
 
 
-# ─── SCENARIO → RESPONSE COLUMN MAPPING ──────────────────────────────────────
-# Ordered most-specific → least-specific; first match wins.
-SCENARIO_RESPONSE_COL_MAP = [
-    ("normal onset followed by",   "English response (normal onset)"),
-    ("irrigated",                  "English response (normal onset)"),
-    ("delayed 8",                  "English response (8 week delay)"),
-    ("delayed 6",                  "English response (6 week delay)"),
-    ("delayed 4",                  "English response (4 week delay)"),
-    ("delayed 2",                  "English response (2 week delay)"),
-    ("normal",                     "English response (normal onset)"),
-]
-
-def select_response_col(scenario_str):
-    s = str(scenario_str).lower()
-    for pattern, col in SCENARIO_RESPONSE_COL_MAP:
-        if pattern in s:
-            return col
-    return "English response (normal onset)"
-
-
-# ─── SCENARIO → GOLDEN DATASET FILTER ────────────────────────────────────────
-# Maps query-bank col G keywords → substring to match in golden "Specific Scenario".
-SCENARIO_GOLDEN_MAP = [
-    # Most specific first.
-    # Delayed patterns use [^\d]* to skip any tilde/space before the digit, so
-    # "Delayed ~2-4 weeks" matches Delayed[^\d]*2 but NOT Delayed[^\d]*4
-    # (the first digit after non-digits is 2, not 4).
-    # Normal uses a negative lookahead to avoid matching "Normal onset followed by dry spell".
-    ("normal onset followed by",   r"dry spell"),
-    ("irrigated - non-release",    r"Non-release"),
-    ("irrigated - delayed",        r"Delayed release"),
-    ("delayed 8",                  r"Delayed[^\d]*8"),
-    ("delayed 6",                  r"Delayed[^\d]*6"),
-    ("delayed 4",                  r"Delayed[^\d]*4"),
-    ("delayed 2",                  r"Delayed[^\d]*2"),
-    ("normal",                     r"Normal(?!.*dry)"),
-]
-
-def scenario_golden_filter(scenario_str):
-    """Return substring to match against golden 'Specific Scenario' column."""
-    s = str(scenario_str).lower()
-    for pattern, golden_substr in SCENARIO_GOLDEN_MAP:
-        if pattern in s:
-            return golden_substr
-    return None
-
-
 # ─── ADVERSARIAL FLAGGING PHRASES ────────────────────────────────────────────
 FLAGGING_PHRASES = [
     "does not exist", "not valid", "incorrect", "not found", "please clarify",
@@ -195,17 +159,6 @@ FLAGGING_PHRASES = [
 
 def has_devanagari(text):
     return bool(re.search(r'[ऀ-ॿ]', str(text)))
-
-def to_latin(text):
-    if INDIC_AVAILABLE and has_devanagari(text):
-        try:
-            return transliterate(str(text), sanscript.DEVANAGARI, sanscript.ITRANS).lower()
-        except Exception:
-            pass
-    return str(text).lower()
-
-def extract_name(kw):
-    return re.split(r'\s*\(', kw)[0].strip()
 
 def parse_key_inputs(raw):
     if pd.isna(raw):
@@ -238,7 +191,7 @@ def is_monsoon_scenario(scenario_text):
     sl = str(scenario_text).lower()
     return any(kw in sl for kw in MONSOON_SCENARIO_KEYWORDS)
 
-def find_golden_rows(gd_sheets, district, land_type, irrigation, scenario_hint=None):
+def find_golden_rows(gd_sheets, district, land_type, irrigation):
     if district not in gd_sheets:
         return pd.DataFrame(), f"Sheet '{district}' not found"
     sheet = gd_sheets[district].copy()
@@ -248,23 +201,18 @@ def find_golden_rows(gd_sheets, district, land_type, irrigation, scenario_hint=N
     elif irrigation == "Yes":
         sheet = sheet[sheet["Irrigation Available"].isin(["Yes", "Yes/No"])]
     if land_type:
-        # "low land" (two words) is used in Jashpur irrigated rows
-        pat = r"lowland|low land" if land_type == "lowland" else re.escape(land_type)
-        mask = sheet["Land Type"].str.lower().str.contains(pat, na=False)
+        mask = sheet["Land Type"].str.lower().str.contains(re.escape(land_type), na=False)
         if mask.sum() == 0:
             words = [w for w in land_type.split() if len(w) > 2]
             if words:
                 mask = sheet["Land Type"].str.lower().apply(lambda x: any(w in x for w in words))
         sheet = sheet[mask]
     if "Specific Scenario" in sheet.columns:
-        if scenario_hint:
-            sheet = sheet[sheet["Specific Scenario"].str.contains(scenario_hint, case=False, na=False)]
-        else:
-            sheet = sheet[sheet["Specific Scenario"].apply(is_monsoon_scenario)]
+        sheet = sheet[sheet["Specific Scenario"].apply(is_monsoon_scenario)]
     else:
         print(f"  WARNING: 'Specific Scenario' column missing in '{district}' — skipping scenario filter")
     if sheet.empty:
-        return pd.DataFrame(), "No row matches (district + land type + irrigation + scenario)"
+        return pd.DataFrame(), "No row matches (district + land type + irrigation + monsoon scenario)"
     return sheet, "OK"
 
 def golden_rows_label(golden_rows, district):
@@ -292,56 +240,60 @@ def build_union_keywords(golden_rows):
             union.extend(new_kws)
     return union
 
-def split_into_chunks(text):
-    raw = re.split(r'[\n]+|(?<=[.!?])\s+', text)
-    chunks = []
-    for part in raw:
-        chunks.extend(re.split(r'\s*[-•*]\s+', part))
-    return [c.strip() for c in chunks if len(c.strip()) > 8]
 
-def score_keywords(response, keywords, fuzzy_threshold=75):
+def score_keywords(response, keywords):
+    """Score keywords against a response using Claude Sonnet 4.6 as the judge.
+
+    Claude receives the full response and keyword list, then returns a JSON object
+    identifying which keywords are captured (even via paraphrasing or translation).
+    """
     if not keywords or pd.isna(response):
         return None, [], []
-    resp = to_latin(str(response))
 
-    # Pre-compute response chunk embeddings once — reused across all keywords for this row
-    chunk_embs = None
-    if SEMANTIC_AVAILABLE:
-        chunks = split_into_chunks(resp)
-        if chunks:
-            chunk_embs = _SEMANTIC_MODEL.encode(chunks, convert_to_tensor=True)
+    resp = str(response).strip()
+    n = len(keywords)
+    kw_list_str = "\n".join(f"- {kw}" for kw in keywords)
 
-    matched, missed = [], []
-    semantic_queue = []
+    prompt = KEYWORD_JUDGE_PROMPT.format(
+        response=resp,
+        keywords_list=kw_list_str,
+    )
 
+    try:
+        message = _ANTHROPIC_CLIENT.messages.create(
+            model=LLM_MODEL,
+            max_tokens=1024,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        raw = message.content[0].text.strip()
+    except anthropic.APIError as e:
+        print(f"  API error: {e}")
+        return None, [], list(keywords)
+
+    # Strip optional ```json ... ``` fences Claude may add
+    raw = re.sub(r"^```(?:json)?\s*", "", raw)
+    raw = re.sub(r"\s*```$", "", raw)
+
+    try:
+        result = json.loads(raw)
+    except json.JSONDecodeError:
+        print(f"  JSON parse error. Raw response:\n{raw[:300]}")
+        return None, [], list(keywords)
+
+    # Case-insensitive reconciliation: map Claude's strings back to original keywords
+    captured_lower = {s.lower() for s in result.get("captured", [])}
+
+    matched = []
+    missed = []
     for kw in keywords:
-        kw_lower  = kw.lower()
-        name_only = extract_name(kw).lower()
-        if kw_lower in resp:
-            matched.append(kw)
-        elif name_only and len(name_only) > 3 and name_only in resp:
-            matched.append(f"{kw} [name match]")
-        elif RAPIDFUZZ_AVAILABLE and fuzz.partial_ratio(kw_lower, resp) >= fuzzy_threshold:
-            matched.append(f"{kw} [~fuzzy]")
-        elif chunk_embs is not None:
-            semantic_queue.append(kw)
+        if kw.lower() in captured_lower:
+            matched.append(f"{kw} [~llm]")
         else:
             missed.append(kw)
 
-    # Batch-encode all queued keywords and check against response chunks
-    if semantic_queue:
-        kw_embs = _SEMANTIC_MODEL.encode(
-            [kw.lower() for kw in semantic_queue], convert_to_tensor=True
-        )
-        sims = cos_sim(kw_embs, chunk_embs)  # (n_queued, n_chunks)
-        for kw, row_sims in zip(semantic_queue, sims):
-            if row_sims.max().item() >= SEMANTIC_THRESHOLD:
-                matched.append(f"{kw} [~semantic]")
-            else:
-                missed.append(kw)
-
-    pct = round(len(matched) / len(keywords) * 100, 1) if keywords else None
+    pct = round(len(matched) / n * 100, 1)
     return pct, matched, missed
+
 
 def score_adversarial(response):
     if pd.isna(response) or str(response).strip() == "":
@@ -391,17 +343,13 @@ def main():
     std_results = []
 
     for _, row in pb.iterrows():
-        sr           = int(row["Q#"])
-        prompt       = str(row["English Query"])
-        district     = str(row["District"]).strip() if pd.notna(row["District"]) else ""
-        local_term   = str(row["Land Type (local term)"]).strip().lower() if pd.notna(row["Land Type (local term)"]) else ""
-        land_type    = LAND_TYPE_SYNONYMS.get(local_term, local_term) if local_term else None
-        irrigation   = "Yes" if str(row["Irrigation"]).strip() == "Yes" else "No"
-        scenario_raw = str(row["Scenario this maps to (backend-detected, NOT in query)"]).strip() \
-                       if pd.notna(row["Scenario this maps to (backend-detected, NOT in query)"]) else ""
-        response_col = select_response_col(scenario_raw)
-        response     = row[response_col] if pd.notna(row.get(response_col)) else row["English response (normal onset)"]
-        golden_hint  = scenario_golden_filter(scenario_raw)
+        sr         = int(row["Q#"])
+        prompt     = str(row["English Query"])
+        response   = row["English response (normal onset)"]
+        district   = str(row["District"]).strip() if pd.notna(row["District"]) else ""
+        local_term = str(row["Land Type (local term)"]).strip().lower() if pd.notna(row["Land Type (local term)"]) else ""
+        land_type  = LAND_TYPE_SYNONYMS.get(local_term, local_term) if local_term else None
+        irrigation = "Yes" if str(row["Irrigation"]).strip() == "Yes" else "No"
 
         rec = {
             "Q#"                  : sr,
@@ -414,8 +362,6 @@ def main():
             "Score (%)"           : "",
             "Golden Dataset Rows" : "",
             "Notes"               : "",
-            "Scenario"            : scenario_raw,
-            "Response Col Used"   : response_col,
         }
 
         if not district:
@@ -426,7 +372,7 @@ def main():
 
         rec["Key Inputs"] = f"{district} / {land_type or 'land type not specified'} / {'No irrigation' if irrigation == 'No' else 'Irrigation available'}"
 
-        golden_rows, status = find_golden_rows(gd, district, land_type, irrigation, scenario_hint=golden_hint)
+        golden_rows, status = find_golden_rows(gd, district, land_type, irrigation)
         if golden_rows.empty:
             rec["Score (%)"] = "N/A"
             rec["Notes"] = f"No golden dataset match — {status}"
@@ -455,7 +401,7 @@ def main():
         pct, matched, missed = score_keywords(response, union_kw)
         if pct is None:
             rec["Score (%)"] = "N/A"
-            rec["Notes"] = "Keywords column empty in golden dataset"
+            rec["Notes"] = "Keywords column empty in golden dataset or API error"
         else:
             rec["Score (%)"]         = pct
             rec["Keywords Captured"] = ("• " + "\n• ".join(matched)) if matched else ""
@@ -497,7 +443,7 @@ def main():
         set_col_widths(ws, {
             "A": 6,  "B": 50, "C": 55, "D": 35,
             "E": 55, "F": 55, "G": 55, "H": 10,
-            "I": 28, "J": 40,  "K": 40, "L": 25,
+            "I": 28, "J": 40,
         })
         for row in ws.iter_rows(min_row=2, max_row=ws.max_row):
             score_cell = row[7]

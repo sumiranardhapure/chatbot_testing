@@ -1,20 +1,21 @@
 #!/usr/bin/env python3
 """
-CRIDA DACP Chatbot Scoring Script
-===================================
+CRIDA DACP Chatbot Scoring Script — RRF edition
+================================================
 Scores chatbot responses (col L "English response (normal onset)") against
-golden dataset keywords. Restricted to Balrampur, Surajpur, and Jashpur districts.
+golden dataset keywords using Reciprocal Rank Fusion.
+Restricted to Balrampur, Surajpur, and Jashpur districts.
 
 Setup (run once in terminal):
     pip3 install pandas openpyxl rapidfuzz indic-transliteration
 
 Usage:
     Run from any directory:
-        python3 code/score_chatbot.py
+        python3 code/score_chatbot_rrf.py
     Input files are read from data/, output is written to output/.
 
 Output:
-    Chatbot_Scoring_Results_v4.xlsx — two sheets: Summary, Standard Scores.
+    Chatbot_Scoring_Results_rrf.xlsx — two sheets: Summary, Standard Scores.
 """
 
 import re
@@ -52,12 +53,24 @@ except ImportError:
 
 
 # ─── TUNABLE THRESHOLDS ───────────────────────────────────────────────────────
-SEMANTIC_THRESHOLD = 0.60   # cosine similarity floor for semantic keyword match
+SEMANTIC_THRESHOLD  = 0.60   # fallback floor when only semantic is available
+FUZZY_THRESHOLD     = 75     # fallback floor (0–100) when only fuzzy is available
+
+# ─── RRF PARAMETERS ───────────────────────────────────────────────────────────
+# Small k amplifies rank differences vs. the IR default of 60, which compresses
+# too much for short keyword lists (typically 10–30 items).
+#
+# With k=5 and 2 methods, RRF score range:
+#   rank 1 in both  → 1/6 + 1/6 ≈ 0.333   ← strong match
+#   rank 3 in both  → 1/8 + 1/8 ≈ 0.250   ← threshold
+#   rank 5 in both  → 1/10 + 1/10 = 0.200 ← miss
+RRF_K               = 5
+RRF_MATCH_THRESHOLD = 0.25
 
 # ─── FILE PATHS ───────────────────────────────────────────────────────────────
 PROMPT_BANK_FILE    = DATA_DIR / "Chatbot_Query_Bank_Surajpur_Balrampur_Jashpur_v2.xlsx"
 GOLDEN_DATASET_FILE = DATA_DIR / "golden_dataset_v2.xlsx"
-OUTPUT_FILE         = OUTPUT_DIR / "Chatbot_Scoring_Results_v5.xlsx"
+OUTPUT_FILE         = OUTPUT_DIR / "Chatbot_Scoring_Results_rrf.xlsx"
 
 
 # ─── SUB-DISTRICT → DISTRICT MAPPING ─────────────────────────────────────────
@@ -128,53 +141,6 @@ MONSOON_SCENARIO_KEYWORDS = [
 ]
 
 
-# ─── SCENARIO → RESPONSE COLUMN MAPPING ──────────────────────────────────────
-# Ordered most-specific → least-specific; first match wins.
-SCENARIO_RESPONSE_COL_MAP = [
-    ("normal onset followed by",   "English response (normal onset)"),
-    ("irrigated",                  "English response (normal onset)"),
-    ("delayed 8",                  "English response (8 week delay)"),
-    ("delayed 6",                  "English response (6 week delay)"),
-    ("delayed 4",                  "English response (4 week delay)"),
-    ("delayed 2",                  "English response (2 week delay)"),
-    ("normal",                     "English response (normal onset)"),
-]
-
-def select_response_col(scenario_str):
-    s = str(scenario_str).lower()
-    for pattern, col in SCENARIO_RESPONSE_COL_MAP:
-        if pattern in s:
-            return col
-    return "English response (normal onset)"
-
-
-# ─── SCENARIO → GOLDEN DATASET FILTER ────────────────────────────────────────
-# Maps query-bank col G keywords → substring to match in golden "Specific Scenario".
-SCENARIO_GOLDEN_MAP = [
-    # Most specific first.
-    # Delayed patterns use [^\d]* to skip any tilde/space before the digit, so
-    # "Delayed ~2-4 weeks" matches Delayed[^\d]*2 but NOT Delayed[^\d]*4
-    # (the first digit after non-digits is 2, not 4).
-    # Normal uses a negative lookahead to avoid matching "Normal onset followed by dry spell".
-    ("normal onset followed by",   r"dry spell"),
-    ("irrigated - non-release",    r"Non-release"),
-    ("irrigated - delayed",        r"Delayed release"),
-    ("delayed 8",                  r"Delayed[^\d]*8"),
-    ("delayed 6",                  r"Delayed[^\d]*6"),
-    ("delayed 4",                  r"Delayed[^\d]*4"),
-    ("delayed 2",                  r"Delayed[^\d]*2"),
-    ("normal",                     r"Normal(?!.*dry)"),
-]
-
-def scenario_golden_filter(scenario_str):
-    """Return substring to match against golden 'Specific Scenario' column."""
-    s = str(scenario_str).lower()
-    for pattern, golden_substr in SCENARIO_GOLDEN_MAP:
-        if pattern in s:
-            return golden_substr
-    return None
-
-
 # ─── ADVERSARIAL FLAGGING PHRASES ────────────────────────────────────────────
 FLAGGING_PHRASES = [
     "does not exist", "not valid", "incorrect", "not found", "please clarify",
@@ -238,7 +204,7 @@ def is_monsoon_scenario(scenario_text):
     sl = str(scenario_text).lower()
     return any(kw in sl for kw in MONSOON_SCENARIO_KEYWORDS)
 
-def find_golden_rows(gd_sheets, district, land_type, irrigation, scenario_hint=None):
+def find_golden_rows(gd_sheets, district, land_type, irrigation):
     if district not in gd_sheets:
         return pd.DataFrame(), f"Sheet '{district}' not found"
     sheet = gd_sheets[district].copy()
@@ -248,23 +214,18 @@ def find_golden_rows(gd_sheets, district, land_type, irrigation, scenario_hint=N
     elif irrigation == "Yes":
         sheet = sheet[sheet["Irrigation Available"].isin(["Yes", "Yes/No"])]
     if land_type:
-        # "low land" (two words) is used in Jashpur irrigated rows
-        pat = r"lowland|low land" if land_type == "lowland" else re.escape(land_type)
-        mask = sheet["Land Type"].str.lower().str.contains(pat, na=False)
+        mask = sheet["Land Type"].str.lower().str.contains(re.escape(land_type), na=False)
         if mask.sum() == 0:
             words = [w for w in land_type.split() if len(w) > 2]
             if words:
                 mask = sheet["Land Type"].str.lower().apply(lambda x: any(w in x for w in words))
         sheet = sheet[mask]
     if "Specific Scenario" in sheet.columns:
-        if scenario_hint:
-            sheet = sheet[sheet["Specific Scenario"].str.contains(scenario_hint, case=False, na=False)]
-        else:
-            sheet = sheet[sheet["Specific Scenario"].apply(is_monsoon_scenario)]
+        sheet = sheet[sheet["Specific Scenario"].apply(is_monsoon_scenario)]
     else:
         print(f"  WARNING: 'Specific Scenario' column missing in '{district}' — skipping scenario filter")
     if sheet.empty:
-        return pd.DataFrame(), "No row matches (district + land type + irrigation + scenario)"
+        return pd.DataFrame(), "No row matches (district + land type + irrigation + monsoon scenario)"
     return sheet, "OK"
 
 def golden_rows_label(golden_rows, district):
@@ -299,49 +260,109 @@ def split_into_chunks(text):
         chunks.extend(re.split(r'\s*[-•*]\s+', part))
     return [c.strip() for c in chunks if len(c.strip()) > 8]
 
-def score_keywords(response, keywords, fuzzy_threshold=75):
+
+def _rrf_ranks(scores):
+    """Return 1-based ranks for a list of scores (highest score → rank 1)."""
+    order = sorted(range(len(scores)), key=lambda i: -scores[i])
+    ranks = [0] * len(scores)
+    for pos, idx in enumerate(order):
+        ranks[idx] = pos + 1
+    return ranks
+
+
+def score_keywords(response, keywords):
+    """Score keywords against a response using Reciprocal Rank Fusion.
+
+    Pass 1 — exact/name match (fast, always wins).
+    Pass 2 — score remaining candidates with fuzzy + semantic.
+    Pass 3 — combine signals via RRF; fall back to single-method thresholds
+              when only one matcher is available.
+    """
     if not keywords or pd.isna(response):
         return None, [], []
     resp = to_latin(str(response))
+    n = len(keywords)
 
-    # Pre-compute response chunk embeddings once — reused across all keywords for this row
+    # Pre-compute response chunk embeddings once
     chunk_embs = None
     if SEMANTIC_AVAILABLE:
         chunks = split_into_chunks(resp)
         if chunks:
             chunk_embs = _SEMANTIC_MODEL.encode(chunks, convert_to_tensor=True)
 
-    matched, missed = [], []
-    semantic_queue = []
+    matched = []
+    rrf_indices = []  # indices of keywords that didn't exact/name-match
 
-    for kw in keywords:
+    # ── Pass 1: exact and name match ─────────────────────────────────────────
+    for i, kw in enumerate(keywords):
         kw_lower  = kw.lower()
         name_only = extract_name(kw).lower()
         if kw_lower in resp:
             matched.append(kw)
         elif name_only and len(name_only) > 3 and name_only in resp:
             matched.append(f"{kw} [name match]")
-        elif RAPIDFUZZ_AVAILABLE and fuzz.partial_ratio(kw_lower, resp) >= fuzzy_threshold:
-            matched.append(f"{kw} [~fuzzy]")
-        elif chunk_embs is not None:
-            semantic_queue.append(kw)
         else:
-            missed.append(kw)
+            rrf_indices.append(i)
 
-    # Batch-encode all queued keywords and check against response chunks
-    if semantic_queue:
+    if not rrf_indices:
+        pct = round(len(matched) / n * 100, 1)
+        return pct, matched, []
+
+    cand_kws = [keywords[i] for i in rrf_indices]
+
+    # ── Pass 2: score each candidate ─────────────────────────────────────────
+    fuzzy_scores = []
+    if RAPIDFUZZ_AVAILABLE:
+        for kw in cand_kws:
+            fuzzy_scores.append(fuzz.partial_ratio(kw.lower(), resp) / 100.0)
+
+    semantic_scores = []
+    if chunk_embs is not None:
         kw_embs = _SEMANTIC_MODEL.encode(
-            [kw.lower() for kw in semantic_queue], convert_to_tensor=True
+            [kw.lower() for kw in cand_kws], convert_to_tensor=True
         )
-        sims = cos_sim(kw_embs, chunk_embs)  # (n_queued, n_chunks)
-        for kw, row_sims in zip(semantic_queue, sims):
-            if row_sims.max().item() >= SEMANTIC_THRESHOLD:
-                matched.append(f"{kw} [~semantic]")
+        sims = cos_sim(kw_embs, chunk_embs)  # (n_cands, n_chunks)
+        semantic_scores = [row.max().item() for row in sims]
+
+    n_methods = sum([bool(fuzzy_scores), bool(semantic_scores)])
+
+    # ── Pass 3: classify via RRF (or single-method fallback) ─────────────────
+    missed = []
+
+    if n_methods == 2:
+        fuzzy_ranks    = _rrf_ranks(fuzzy_scores)
+        semantic_ranks = _rrf_ranks(semantic_scores)
+        for j, kw in enumerate(cand_kws):
+            rrf_score = (
+                1 / (RRF_K + fuzzy_ranks[j])
+                + 1 / (RRF_K + semantic_ranks[j])
+            )
+            if rrf_score >= RRF_MATCH_THRESHOLD:
+                matched.append(f"{kw} [~rrf]")
             else:
                 missed.append(kw)
 
-    pct = round(len(matched) / len(keywords) * 100, 1) if keywords else None
+    elif n_methods == 1:
+        # Single method: use its raw threshold (preserves old behaviour)
+        if fuzzy_scores:
+            for j, kw in enumerate(cand_kws):
+                if fuzzy_scores[j] >= FUZZY_THRESHOLD / 100.0:
+                    matched.append(f"{kw} [~fuzzy]")
+                else:
+                    missed.append(kw)
+        else:
+            for j, kw in enumerate(cand_kws):
+                if semantic_scores[j] >= SEMANTIC_THRESHOLD:
+                    matched.append(f"{kw} [~semantic]")
+                else:
+                    missed.append(kw)
+
+    else:
+        missed.extend(cand_kws)
+
+    pct = round(len(matched) / n * 100, 1)
     return pct, matched, missed
+
 
 def score_adversarial(response):
     if pd.isna(response) or str(response).strip() == "":
@@ -391,17 +412,13 @@ def main():
     std_results = []
 
     for _, row in pb.iterrows():
-        sr           = int(row["Q#"])
-        prompt       = str(row["English Query"])
-        district     = str(row["District"]).strip() if pd.notna(row["District"]) else ""
-        local_term   = str(row["Land Type (local term)"]).strip().lower() if pd.notna(row["Land Type (local term)"]) else ""
-        land_type    = LAND_TYPE_SYNONYMS.get(local_term, local_term) if local_term else None
-        irrigation   = "Yes" if str(row["Irrigation"]).strip() == "Yes" else "No"
-        scenario_raw = str(row["Scenario this maps to (backend-detected, NOT in query)"]).strip() \
-                       if pd.notna(row["Scenario this maps to (backend-detected, NOT in query)"]) else ""
-        response_col = select_response_col(scenario_raw)
-        response     = row[response_col] if pd.notna(row.get(response_col)) else row["English response (normal onset)"]
-        golden_hint  = scenario_golden_filter(scenario_raw)
+        sr         = int(row["Q#"])
+        prompt     = str(row["English Query"])
+        response   = row["English response (normal onset)"]
+        district   = str(row["District"]).strip() if pd.notna(row["District"]) else ""
+        local_term = str(row["Land Type (local term)"]).strip().lower() if pd.notna(row["Land Type (local term)"]) else ""
+        land_type  = LAND_TYPE_SYNONYMS.get(local_term, local_term) if local_term else None
+        irrigation = "Yes" if str(row["Irrigation"]).strip() == "Yes" else "No"
 
         rec = {
             "Q#"                  : sr,
@@ -414,8 +431,6 @@ def main():
             "Score (%)"           : "",
             "Golden Dataset Rows" : "",
             "Notes"               : "",
-            "Scenario"            : scenario_raw,
-            "Response Col Used"   : response_col,
         }
 
         if not district:
@@ -426,7 +441,7 @@ def main():
 
         rec["Key Inputs"] = f"{district} / {land_type or 'land type not specified'} / {'No irrigation' if irrigation == 'No' else 'Irrigation available'}"
 
-        golden_rows, status = find_golden_rows(gd, district, land_type, irrigation, scenario_hint=golden_hint)
+        golden_rows, status = find_golden_rows(gd, district, land_type, irrigation)
         if golden_rows.empty:
             rec["Score (%)"] = "N/A"
             rec["Notes"] = f"No golden dataset match — {status}"
@@ -497,7 +512,7 @@ def main():
         set_col_widths(ws, {
             "A": 6,  "B": 50, "C": 55, "D": 35,
             "E": 55, "F": 55, "G": 55, "H": 10,
-            "I": 28, "J": 40,  "K": 40, "L": 25,
+            "I": 28, "J": 40,
         })
         for row in ws.iter_rows(min_row=2, max_row=ws.max_row):
             score_cell = row[7]
