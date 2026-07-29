@@ -128,52 +128,6 @@ MONSOON_SCENARIO_KEYWORDS = [
 ]
 
 
-# ─── SCENARIO → RESPONSE COLUMN MAPPING ──────────────────────────────────────
-# Ordered most-specific → least-specific; first match wins.
-SCENARIO_RESPONSE_COL_MAP = [
-    ("normal onset followed by",   "English response (normal onset)"),
-    ("irrigated",                  "English response (normal onset)"),
-    ("delayed 8",                  "English response (8 week delay)"),
-    ("delayed 6",                  "English response (6 week delay)"),
-    ("delayed 4",                  "English response (4 week delay)"),
-    ("delayed 2",                  "English response (2 week delay)"),
-    ("normal",                     "English response (normal onset)"),
-]
-
-def select_response_col(scenario_str):
-    s = str(scenario_str).lower()
-    for pattern, col in SCENARIO_RESPONSE_COL_MAP:
-        if pattern in s:
-            return col
-    return "English response (normal onset)"
-
-
-# ─── SCENARIO → GOLDEN DATASET FILTER ────────────────────────────────────────
-# Maps query-bank col G keywords → substring to match in golden "Specific Scenario".
-SCENARIO_GOLDEN_MAP = [
-    # Most specific first.
-    # Delayed patterns use [^\d]* to skip any tilde/space before the digit, so
-    # "Delayed ~2-4 weeks" matches Delayed[^\d]*2 but NOT Delayed[^\d]*4
-    # (the first digit after non-digits is 2, not 4).
-    # Normal uses a negative lookahead to avoid matching "Normal onset followed by dry spell".
-    ("normal onset followed by",   r"dry spell"),
-    ("irrigated - non-release",    r"Non-release"),
-    ("irrigated - delayed",        r"Delayed release"),
-    ("delayed 8",                  r"Delayed[^\d]*8"),
-    ("delayed 6",                  r"Delayed[^\d]*6"),
-    ("delayed 4",                  r"Delayed[^\d]*4"),
-    ("delayed 2",                  r"Delayed[^\d]*2"),
-    ("normal",                     r"Normal(?!.*dry)"),
-]
-
-def scenario_golden_filter(scenario_str):
-    """Return substring to match against golden 'Specific Scenario' column."""
-    s = str(scenario_str).lower()
-    for pattern, golden_substr in SCENARIO_GOLDEN_MAP:
-        if pattern in s:
-            return golden_substr
-    return None
-
 
 # ─── ADVERSARIAL FLAGGING PHRASES ────────────────────────────────────────────
 FLAGGING_PHRASES = [
@@ -238,7 +192,7 @@ def is_monsoon_scenario(scenario_text):
     sl = str(scenario_text).lower()
     return any(kw in sl for kw in MONSOON_SCENARIO_KEYWORDS)
 
-def find_golden_rows(gd_sheets, district, land_type, irrigation, scenario_hint=None):
+def find_golden_rows(gd_sheets, district, land_type, irrigation):
     if district not in gd_sheets:
         return pd.DataFrame(), f"Sheet '{district}' not found"
     sheet = gd_sheets[district].copy()
@@ -257,10 +211,7 @@ def find_golden_rows(gd_sheets, district, land_type, irrigation, scenario_hint=N
                 mask = sheet["Land Type"].str.lower().apply(lambda x: any(w in x for w in words))
         sheet = sheet[mask]
     if "Specific Scenario" in sheet.columns:
-        if scenario_hint:
-            sheet = sheet[sheet["Specific Scenario"].str.contains(scenario_hint, case=False, na=False)]
-        else:
-            sheet = sheet[sheet["Specific Scenario"].apply(is_monsoon_scenario)]
+        sheet = sheet[sheet["Specific Scenario"].apply(is_monsoon_scenario)]
     else:
         print(f"  WARNING: 'Specific Scenario' column missing in '{district}' — skipping scenario filter")
     if sheet.empty:
@@ -397,11 +348,7 @@ def main():
         local_term   = str(row["Land Type (local term)"]).strip().lower() if pd.notna(row["Land Type (local term)"]) else ""
         land_type    = LAND_TYPE_SYNONYMS.get(local_term, local_term) if local_term else None
         irrigation   = "Yes" if str(row["Irrigation"]).strip() == "Yes" else "No"
-        scenario_raw = str(row["Scenario this maps to (backend-detected, NOT in query)"]).strip() \
-                       if pd.notna(row["Scenario this maps to (backend-detected, NOT in query)"]) else ""
-        response_col = select_response_col(scenario_raw)
-        response     = row[response_col] if pd.notna(row.get(response_col)) else row["English response (normal onset)"]
-        golden_hint  = scenario_golden_filter(scenario_raw)
+        response     = row["English response (normal onset)"]
 
         rec = {
             "Q#"                  : sr,
@@ -414,8 +361,6 @@ def main():
             "Score (%)"           : "",
             "Golden Dataset Rows" : "",
             "Notes"               : "",
-            "Scenario"            : scenario_raw,
-            "Response Col Used"   : response_col,
         }
 
         if not district:
@@ -426,7 +371,7 @@ def main():
 
         rec["Key Inputs"] = f"{district} / {land_type or 'land type not specified'} / {'No irrigation' if irrigation == 'No' else 'Irrigation available'}"
 
-        golden_rows, status = find_golden_rows(gd, district, land_type, irrigation, scenario_hint=golden_hint)
+        golden_rows, status = find_golden_rows(gd, district, land_type, irrigation)
         if golden_rows.empty:
             rec["Score (%)"] = "N/A"
             rec["Notes"] = f"No golden dataset match — {status}"
@@ -493,11 +438,11 @@ def main():
 
         std_df.to_excel(writer, index=False, sheet_name="Standard Scores")
         ws = writer.sheets["Standard Scores"]
-        style_header(ws, audit_col_idx=9)
+        style_header(ws)
         set_col_widths(ws, {
             "A": 6,  "B": 50, "C": 55, "D": 35,
             "E": 55, "F": 55, "G": 55, "H": 10,
-            "I": 28, "J": 40,  "K": 40, "L": 25,
+            "I": 28, "J": 40,
         })
         for row in ws.iter_rows(min_row=2, max_row=ws.max_row):
             score_cell = row[7]
