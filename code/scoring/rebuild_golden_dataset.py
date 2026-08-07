@@ -8,6 +8,8 @@ Golden Dataset Phase 1 Rebuild
 - Apply clean formatting: text wrap, column widths, frozen header
 Output: golden_dataset_v2.xlsx
 """
+from pathlib import Path
+
 import pandas as pd
 from openpyxl import load_workbook
 from openpyxl.styles import (
@@ -15,8 +17,10 @@ from openpyxl.styles import (
 )
 from openpyxl.utils import get_column_letter
 
-INPUT_FILE  = "golden_dataset.xlsx"
-OUTPUT_FILE = "golden_dataset_v2.xlsx"
+BASE_DIR    = Path(__file__).parent.parent.parent
+DATA_DIR    = BASE_DIR / "data"
+INPUT_FILE  = DATA_DIR / "golden_dataset.xlsx"
+OUTPUT_FILE = DATA_DIR / "golden_dataset_v2.xlsx"
 
 MONSOON_KEYWORDS = ["delayed", "onset", "early season drought", "normal"]
 

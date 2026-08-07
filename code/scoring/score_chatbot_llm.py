@@ -12,11 +12,11 @@ Setup (run once in terminal):
 
 Usage:
     Run from any directory:
-        python3 code/score_chatbot_llm.py
-    Input files are read from data/, output is written to output/.
+        python3 code/scoring/score_chatbot_llm.py
+    Input files are read from data/, output is written to output/scoring/.
 
 Output:
-    Chatbot_Scoring_Results_llm.xlsx — two sheets: Summary, Standard Scores.
+    output/scoring/Chatbot_Scoring_Results_llm.xlsx — two sheets: Summary, Standard Scores.
 """
 
 import re
@@ -27,7 +27,7 @@ import pandas as pd
 from openpyxl.styles import PatternFill, Font, Alignment
 import anthropic
 
-BASE_DIR   = Path(__file__).parent.parent
+BASE_DIR   = Path(__file__).parent.parent.parent
 DATA_DIR   = BASE_DIR / "data"
 OUTPUT_DIR = BASE_DIR / "output"
 
@@ -68,7 +68,7 @@ Use the exact keyword strings from the list above. Do not add any explanation ou
 # ─── FILE PATHS ───────────────────────────────────────────────────────────────
 PROMPT_BANK_FILE    = DATA_DIR / "Chatbot_Query_Bank_Surajpur_Balrampur_Jashpur_v2.xlsx"
 GOLDEN_DATASET_FILE = DATA_DIR / "golden_dataset_v2.xlsx"
-OUTPUT_FILE         = OUTPUT_DIR / "Chatbot_Scoring_Results_llm.xlsx"
+OUTPUT_FILE         = OUTPUT_DIR / "scoring" / "Chatbot_Scoring_Results_llm.xlsx"
 
 
 # ─── SUB-DISTRICT → DISTRICT MAPPING ─────────────────────────────────────────
@@ -332,6 +332,7 @@ def wrap_data_cells(ws):
 # ─── MAIN ─────────────────────────────────────────────────────────────────────
 
 def main():
+    OUTPUT_FILE.parent.mkdir(parents=True, exist_ok=True)
     print("Loading files...")
     pb = pd.read_excel(PROMPT_BANK_FILE)
     pb.columns = [c.strip() for c in pb.columns]
